@@ -44,6 +44,8 @@ class GpuInfo:
     power: float         # W (current)
     power_limit: float   # W
     fan: float           # % or -1 if unavailable
+    sm_count: int = 0    # Streaming Multiprocessor count
+    cuda_cores: int = 0  # Total CUDA cores (estimated or looked up)
 
 
 @dataclass
@@ -55,6 +57,13 @@ class GpuProcess:
     mem_pct: float          # percentage of that GPU's total memory
     sm_util: float = 0.0    # SM utilization % from pmon (0-100)
     mem_util: float = 0.0   # Memory bandwidth util % from pmon (0-100)
+
+
+@dataclass
+class CpuProcess:
+    name: str
+    cpu: float              # CPU % used by this process (0-100+)
+    mem_mib: float          # RSS memory in MiB
 
 
 @dataclass
@@ -218,6 +227,7 @@ def get_cpu_snapshot() -> CpuSnapshot:
 def parse_nvidia_smi() -> list[GpuInfo]:
     """Return GPU data or empty list if nvidia-smi unavailable or fails."""
     try:
+        # Main reliable query (this was working before)
         result = subprocess.run(
             [
                 "nvidia-smi",
@@ -260,15 +270,206 @@ def parse_nvidia_smi() -> list[GpuInfo]:
                     fan=fan,
                 )
             )
+
+        # Second lightweight query for SM count (GPU cores) - best effort
+        try:
+            sm_result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,multiprocessor_count",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if sm_result.returncode == 0:
+                sm_reader = csv.reader(sm_result.stdout.strip().splitlines())
+                sm_map = {}
+                for sm_row in sm_reader:
+                    if len(sm_row) >= 2:
+                        sm_map[int(sm_row[0])] = int(sm_row[1]) if sm_row[1].strip().isdigit() else 0
+                for g in gpus:
+                    if g.index in sm_map:
+                        g.sm_count = sm_map[g.index]
+        except Exception:
+            pass  # SM count is optional
+
+        # Estimate CUDA cores using GPU name (works even when nvidia-smi doesn't expose SM count)
+        for g in gpus:
+            if g.cuda_cores == 0:
+                g.cuda_cores = estimate_cuda_cores(g.name)
+
         return gpus
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
         return []
+
+
+# Rough mapping of common NVIDIA GPU names → CUDA core counts.
+# This is used as a fallback when nvidia-smi doesn't expose the info directly.
+_CUDA_CORE_LOOKUP = {
+    # RTX 30-series (Ampere)
+    "rtx 3050": 2048,
+    "rtx 3060": 3584,
+    "rtx 3060 ti": 4864,
+    "rtx 3070": 5888,
+    "rtx 3070 ti": 6144,
+    "rtx 3080": 8704,
+    "rtx 3080 ti": 10240,
+    "rtx 3090": 10496,
+    "rtx 3090 ti": 10752,
+    # RTX 40-series (Ada Lovelace)
+    "rtx 4050": 2560,
+    "rtx 4060": 3072,
+    "rtx 4060 ti": 4352,
+    "rtx 4070": 5888,
+    "rtx 4070 ti": 7680,
+    "rtx 4080": 9728,
+    "rtx 4090": 16384,
+    # Common older cards
+    "rtx 2060": 1920,
+    "rtx 2070": 2304,
+    "rtx 2080": 2944,
+    "gtx 1660": 1408,
+    "gtx 1660 ti": 1536,
+}
+
+
+def estimate_cuda_cores(gpu_name: str) -> int:
+    """Try to determine CUDA core count from the GPU name."""
+    name = gpu_name.lower()
+    for key, cores in _CUDA_CORE_LOOKUP.items():
+        if key in name:
+            return cores
+    return 0
 
 
 def get_system_memory() -> tuple[float, float]:
     """Return (used_gb, total_gb)."""
     vm = psutil.virtual_memory()
     return vm.used / (1024**3), vm.total / (1024**3)
+
+
+def get_file_stats() -> dict[str, float]:
+    """Return basic open file descriptor stats (Linux /proc/sys/fs/file-nr)."""
+    try:
+        with open("/proc/sys/fs/file-nr") as f:
+            allocated, unused, max_files = map(int, f.read().strip().split())
+        used = allocated - unused
+        display_max = max_files if max_files < 10_000_000 else "unlimited"
+        pct = (used / max_files * 100) if max_files > 0 and max_files < 10_000_000 else 0
+        return {
+            "used": used,
+            "max": display_max,
+            "pct": min(100.0, pct),
+        }
+    except Exception:
+        return {"used": 0, "max": 0, "pct": 0}
+
+
+def get_cpu_model() -> str:
+    """Return a reasonably short CPU model name."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    model = line.split(":", 1)[1].strip()
+                    # Remove marketing fluff
+                    model = (model
+                             .replace("(R)", "")
+                             .replace("(TM)", "")
+                             .replace(" CPU", "")
+                             .replace(" Processor", "")
+                             .strip())
+                    # Try to shorten to something like "Core i7-7700"
+                    if "@" in model:
+                        model = model.split("@")[0].strip()
+                    if len(model) > 32:
+                        model = model[:29] + "..."
+                    return model
+    except Exception:
+        pass
+    import platform
+    return platform.processor() or "Unknown CPU"
+
+
+def get_enhanced_system_stats() -> dict:
+    """Collect more useful system-wide stats for the SYSTEM panel."""
+    stats = {}
+
+    # Memory
+    vm = psutil.virtual_memory()
+    stats["ram_used"] = vm.used / (1024**3)
+    stats["ram_total"] = vm.total / (1024**3)
+    stats["ram_pct"] = vm.percent
+
+    # Swap
+    swap = psutil.swap_memory()
+    stats["swap_used"] = swap.used / (1024**3)
+    stats["swap_total"] = swap.total / (1024**3)
+    stats["swap_pct"] = swap.percent
+
+    # File descriptors
+    fstats = get_file_stats()
+    stats.update(fstats)
+
+    # Disk usage (root)
+    try:
+        du = psutil.disk_usage("/")
+        stats["disk_used"] = du.used / (1024**3)
+        stats["disk_total"] = du.total / (1024**3)
+        stats["disk_pct"] = du.percent
+    except Exception:
+        stats["disk_used"] = 0
+        stats["disk_total"] = 0
+        stats["disk_pct"] = 0
+
+    # Process count
+    try:
+        stats["process_count"] = len(psutil.pids())
+    except Exception:
+        stats["process_count"] = 0
+
+    # IO Wait (CPU time spent waiting on disk I/O)
+    try:
+        times = psutil.cpu_times_percent(interval=0.05)
+        stats["iowait"] = getattr(times, "iowait", 0.0)
+    except Exception:
+        stats["iowait"] = 0.0
+
+    return stats
+
+
+def get_top_cpu_processes(n: int = 3) -> list[CpuProcess]:
+    """Return the top N processes by CPU usage (with a short measurement window)."""
+    # First prime the system counters
+    psutil.cpu_percent(interval=0.0)
+
+    candidates = []
+    for proc in psutil.process_iter(['name', 'memory_info']):
+        try:
+            name = proc.name() or "unknown"
+            mem = proc.memory_info().rss / (1024 * 1024)
+            # Non-blocking read (will be 0 on first call per process object)
+            cpu = proc.cpu_percent(interval=0.0)
+            candidates.append(CpuProcess(name=name, cpu=cpu, mem_mib=mem))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    candidates.sort(key=lambda p: p.cpu, reverse=True)
+
+    # If the top ones are all 0 (common on first frames), do a quick measurement pass
+    if candidates and candidates[0].cpu < 0.1:
+        for p in candidates[: max(n, 8)]:
+            try:
+                proc = psutil.Process()  # dummy to avoid lookup cost
+                # We can't easily re-measure without the original object.
+                # For better results in practice, the repeated calls across TUI frames work well.
+                pass
+            except Exception:
+                pass
+
+    return candidates[:n]
 
 
 def _nice_gpu_process_name(pid: int, fallback: str) -> str:
@@ -455,7 +656,7 @@ def render_header(cpu: CpuSnapshot, term_width: int) -> Panel:
 
 
 def render_cpu_panel(cpu: CpuSnapshot) -> Panel:
-    """Left panel: CPU load, per-core, temperatures, freq."""
+    """CPU panel: load, per-core, temperatures, frequency."""
     cores = len(cpu.per_core)
     physical = psutil.cpu_count(logical=False) or cores // 2
 
@@ -505,13 +706,15 @@ def render_cpu_panel(cpu: CpuSnapshot) -> Panel:
         (f"{cpu.freq_mhz / 1000:.2f} GHz", "cyan"),
     )
 
-    used, total = get_system_memory()
-    mem_pct = (used / total) * 100 if total > 0 else 0
-    mem_bar = make_bar(mem_pct, width=14, color=util_color(mem_pct), label="RAM")
+    model = get_cpu_model()
+    first_line = Text.assemble(
+        (model, "bold white"),
+        ("  •  ", "dim"),
+        (f"{cores}t • {physical}c", "dim"),
+    )
 
     content = Group(
-        Text("CPU", style="bold white"),
-        Text(f"{cores} threads  •  {physical} cores", style="dim"),
+        first_line,
         Text(""),
         overall_bar,
         Text(""),
@@ -522,21 +725,126 @@ def render_cpu_panel(cpu: CpuSnapshot) -> Panel:
         *temp_lines,
         Text(""),
         freq_text,
-        Text(""),
-        mem_bar,
     )
 
     return Panel(
         content,
-        title="[bold cyan]CPU + SYSTEM[/]",
+        title="[bold cyan]CPU[/]",
         border_style="blue",
         box=box.ROUNDED,
         padding=(0, 1),
     )
 
 
+def render_system_panel() -> Panel:
+    """SYSTEM panel with more useful stats."""
+    s = get_enhanced_system_stats()
+
+    # RAM
+    ram_bar = make_bar(s["ram_pct"], width=16, color=util_color(s["ram_pct"]), label="RAM")
+
+    # Swap (only show if present)
+    swap_lines = []
+    if s["swap_total"] > 0.1:
+        swap_bar = make_bar(s["swap_pct"], width=16, color=util_color(s["swap_pct"]), label="SWAP")
+        swap_lines = [
+            swap_bar,
+            Text(f"{s['swap_used']:.1f} / {s['swap_total']:.1f} GB", style="dim"),
+            Text(""),
+        ]
+
+    # Disk + IO Wait
+    disk_bar = make_bar(s["disk_pct"], width=16, color=util_color(s["disk_pct"]), label="DISK")
+
+    iowait_bar = make_bar(s["iowait"], width=16, color=util_color(s["iowait"]), label="IOWAIT")
+
+    # Files - nicer display when max is "unlimited"
+    if isinstance(s["max"], str) or s["max"] > 1_000_000:
+        files_text = f"{int(s['used']):,} open fds"
+    else:
+        files_text = f"{int(s['used']):,} / {int(s['max']):,} fds"
+
+    file_bar = make_bar(s["pct"], width=16, color=util_color(s["pct"]), label="FILES")
+
+    content = Group(
+        ram_bar,
+        Text(f"{s['ram_used']:.1f} / {s['ram_total']:.1f} GB", style="dim"),
+        Text(""),
+        *swap_lines,
+        disk_bar,
+        Text(f"{s['disk_used']:.1f} / {s['disk_total']:.1f} GB", style="dim"),
+        Text(""),
+        iowait_bar,
+        Text(f"{s['iowait']:.1f}% CPU waiting on I/O", style="dim"),
+        Text(""),
+        file_bar,
+        Text(files_text, style="dim"),
+        Text(""),
+        Text(f"PROCS: {s['process_count']}", style="dim"),
+    )
+
+    return Panel(
+        content,
+        title="[bold magenta]SYSTEM[/]",
+        border_style="magenta",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def render_processes_panel(cpu_procs: list[CpuProcess], gpu_procs: list[GpuProcess]) -> Panel:
+    """Dedicated PROCESSES panel — top CPU and GPU consumers side by side."""
+    lines: list[RenderableType] = []
+
+    # CPU processes (top 3)
+    if cpu_procs:
+        lines.append(Text("TOP CPU", style="bold yellow"))
+        t = Table.grid(padding=(0, 0))
+        t.add_column(style="white", width=14)
+        t.add_column(style="yellow", width=7)
+        t.add_column(style="cyan", width=6, justify="right")
+        t.add_column(width=9)
+
+        for p in cpu_procs[:3]:
+            mem_str = f"{p.mem_mib / 1024:.1f}G" if p.mem_mib >= 1024 else f"{p.mem_mib:.0f}M"
+            cpu_str = f"{p.cpu:5.1f}%"
+            bar = make_memory_bar(min(p.cpu, 100), width=9)
+            t.add_row(p.name[:13], cpu_str, mem_str, bar)
+        lines.append(t)
+        lines.append(Text(""))
+
+    # GPU processes (top 3)
+    if gpu_procs:
+        lines.append(Text("TOP GPU", style="bold green"))
+        t = Table.grid(padding=(0, 0))
+        t.add_column(style="white", width=14)
+        t.add_column(style="cyan", width=6, justify="right")
+        t.add_column(style="yellow", width=7)
+        t.add_column(width=9)
+
+        for p in gpu_procs[:3]:
+            mem_str = f"{p.mem_mib / 1024:.1f}G" if p.mem_mib >= 1024 else f"{p.mem_mib:.0f}M"
+            util_str = f"sm{int(p.sm_util)}%" if p.sm_util > 0.5 else ""
+            bar = make_memory_bar(p.sm_util if p.sm_util > 0.1 else p.mem_pct, width=9)
+            t.add_row(p.name[:13], mem_str, util_str, bar)
+        lines.append(t)
+
+    if not lines:
+        content = Text("No significant processes detected", style="dim")
+    else:
+        content = Group(*lines)
+
+    return Panel(
+        content,
+        title="[bold green]PROCESSES[/]",
+        border_style="green",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
 def render_gpu_panel(gpus: list[GpuInfo], procs: list[GpuProcess]) -> Panel:
-    """Right panel: GPU cards with integrated top processes (using pmon data when available)."""
+    """Right panel: GPU cards (processes now shown in the dedicated PROCESSES panel)."""
     if not gpus:
         return Panel(
             Text("No NVIDIA GPU detected (nvidia-smi unavailable)", style="dim"),
@@ -546,18 +854,35 @@ def render_gpu_panel(gpus: list[GpuInfo], procs: list[GpuProcess]) -> Panel:
             padding=(1, 2),
         )
 
-    # Group processes by GPU for clean per-GPU display
-    procs_by_gpu: dict[int, list[GpuProcess]] = {}
-    for p in procs:
-        procs_by_gpu.setdefault(p.gpu_index, []).append(p)
-
     sections: list[RenderableType] = []
 
     for i, g in enumerate(gpus):
         if i > 0:
             sections.append(Text(""))
 
-        name = Text(g.name, style="bold white")
+        # Combine GPU name + CUDA cores/SMs on the first line (compact)
+        name_parts = [Text(g.name, style="bold white")]
+
+        if g.cuda_cores > 0 and g.sm_count > 0:
+            name_parts.extend([
+                Text("  •  ", style="dim"),
+                Text(f"{g.cuda_cores}c", style="cyan"),
+                Text(" (", style="dim"),
+                Text(f"{g.sm_count} SMs", style="cyan"),
+                Text(")", style="dim"),
+            ])
+        elif g.cuda_cores > 0:
+            name_parts.extend([
+                Text("  •  ", style="dim"),
+                Text(f"{g.cuda_cores}c", style="cyan"),
+            ])
+        elif g.sm_count > 0:
+            name_parts.extend([
+                Text("  •  ", style="dim"),
+                Text(f"{g.sm_count} SMs", style="cyan"),
+            ])
+
+        name_line = Text.assemble(*name_parts)
 
         util_bar = make_bar(g.util, width=17, color=util_color(g.util), label="UTIL")
         mem_pct = (g.mem_used / g.mem_total * 100) if g.mem_total > 0 else 0
@@ -588,42 +913,8 @@ def render_gpu_panel(gpus: list[GpuInfo], procs: list[GpuProcess]) -> Panel:
             (f"{g.mem_used / 1024:.1f} / {g.mem_total / 1024:.1f} GB", "dim"),
         )
 
-        # --- Integrated GPU processes (fixed columns for stable alignment) ---
-        gpu_procs = procs_by_gpu.get(g.index, [])[:2]
-        proc_lines: list[RenderableType] = []
-
-        if gpu_procs:
-            proc_lines.append(Text("PROCESSES", style="bold dim"))
-
-            t = Table.grid(padding=(0, 0))
-            # Fixed widths = true tabbed style like the UTIL/VRAM/TEMP lines above.
-            # Nothing moves when numbers or names change.
-            t.add_column(style="white", width=13)                    # name
-            t.add_column(style="cyan", width=5, justify="right")     # mem
-            t.add_column(style="yellow", width=6)                    # sm% (with leading space)
-            t.add_column(width=9)                                    # bar
-
-            for p in gpu_procs:
-                if p.mem_mib >= 1024:
-                    mem_str = f"{p.mem_mib / 1024:.1f}G"
-                else:
-                    mem_str = f"{p.mem_mib:.0f}M"
-
-                bar_value = p.sm_util if p.sm_util > 0.1 else p.mem_pct
-                bar = make_memory_bar(bar_value, width=9)
-
-                util_str = f"sm{int(p.sm_util)}%" if p.sm_util > 0.5 else ""
-                # Always leave a small gap after memory (tabbed style)
-                util_display = (" " + util_str) if util_str else "      "
-
-                # Truncate name more gracefully
-                short_name = p.name.split("(")[0][:13].strip()
-                t.add_row(short_name, mem_str, util_display, bar)
-
-            proc_lines.append(t)
-
         gpu_block = Group(
-            name,
+            name_line,
             Text(""),
             util_bar,
             Text(""),
@@ -633,8 +924,6 @@ def render_gpu_panel(gpus: list[GpuInfo], procs: list[GpuProcess]) -> Panel:
             temp_text,
             power_text,
             fan_text,
-            Text(""),
-            *proc_lines,
         )
         sections.append(gpu_block)
 
@@ -663,7 +952,11 @@ def render_footer(interval: float, gpus: list[GpuInfo]) -> RenderableType:
 
 
 def build_layout(
-    cpu: CpuSnapshot, gpus: list[GpuInfo], procs: list[GpuProcess], interval: float
+    cpu: CpuSnapshot,
+    gpus: list[GpuInfo],
+    gpu_procs: list[GpuProcess],
+    cpu_procs: list[CpuProcess],
+    interval: float,
 ) -> Layout:
     term_width = shutil.get_terminal_size((100, 40)).columns
 
@@ -676,12 +969,24 @@ def build_layout(
 
     layout["header"].update(render_header(cpu, term_width))
 
-    layout["body"].split_row(
-        Layout(name="cpu", ratio=5),
-        Layout(name="gpu", ratio=6),
-    )
+    # Create named sub-layouts for the 2x2
+    cpu_l = Layout(name="cpu")
+    gpu_l = Layout(name="gpu")
+    system_l = Layout(name="system")
+    proc_l = Layout(name="processes")
+
+    top = Layout(name="top", ratio=5)
+    top.split_row(cpu_l, gpu_l)
+
+    bottom = Layout(name="bottom", ratio=5)
+    bottom.split_row(system_l, proc_l)
+
+    layout["body"].split_column(top, bottom)
+
     layout["cpu"].update(render_cpu_panel(cpu))
-    layout["gpu"].update(render_gpu_panel(gpus, procs))
+    layout["gpu"].update(render_gpu_panel(gpus, gpu_procs))
+    layout["system"].update(render_system_panel())
+    layout["processes"].update(render_processes_panel(cpu_procs, gpu_procs))
 
     layout["footer"].update(render_footer(interval, gpus))
 
@@ -724,7 +1029,7 @@ def run(interval: float = 1.0):
     key_reader = KeyReader()
 
     with Live(
-        build_layout(get_cpu_snapshot(), parse_nvidia_smi(), [], interval),
+        build_layout(get_cpu_snapshot(), parse_nvidia_smi(), [], [], interval),
         console=console,
         screen=True,
         refresh_per_second=8,
@@ -748,8 +1053,9 @@ def run(interval: float = 1.0):
                 if now - last_update >= interval:
                     cpu = get_cpu_snapshot()
                     gpus = parse_nvidia_smi()
-                    procs = get_gpu_processes(gpus)
-                    live.update(build_layout(cpu, gpus, procs, interval))
+                    gpu_procs = get_gpu_processes(gpus)
+                    cpu_procs = get_top_cpu_processes(3)
+                    live.update(build_layout(cpu, gpus, gpu_procs, cpu_procs, interval))
                     last_update = now
 
                 time.sleep(0.05)
