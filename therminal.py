@@ -17,6 +17,7 @@ Features:
 Usage:
     python3 therminal.py
     python3 therminal.py --interval 0.5
+    python3 therminal.py --debug
 """
 
 import argparse
@@ -31,7 +32,7 @@ import termios
 import time
 import tty
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -324,7 +325,7 @@ def get_cpu_snapshot() -> CpuSnapshot:
     )
 
 
-def parse_nvidia_smi() -> list[GpuInfo]:
+def parse_nvidia_smi(debug: bool = False) -> list[GpuInfo]:
     """GPU data with throttle detection + CUDA core / SM count."""
     try:
         result = subprocess.run(
@@ -392,7 +393,9 @@ def parse_nvidia_smi() -> list[GpuInfo]:
                 g.cuda_cores = estimate_cuda_cores(g.name)
 
         return gpus
-    except Exception:
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] nvidia-smi query failed: {e}", file=sys.stderr)
         return []
 
 
@@ -422,7 +425,7 @@ def estimate_cuda_cores(gpu_name: str) -> int:
     return 0
 
 
-def get_gpu_processes(gpus: list[GpuInfo]) -> list[GpuProcess]:
+def get_gpu_processes(gpus: list[GpuInfo], debug: bool = False) -> list[GpuProcess]:
     """
     Collect top GPU processes with real SM utilization (from pmon) + accurate VRAM usage.
     This is the improved version that merges two nvidia-smi queries.
@@ -452,8 +455,9 @@ def get_gpu_processes(gpus: list[GpuInfo]) -> list[GpuProcess]:
                         procs_by_pid[pid].sm_util = max(procs_by_pid[pid].sm_util, sm_util)
                 except (ValueError, IndexError):
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] GPU pmon query failed: {e}", file=sys.stderr)
 
     try:
         # 2. query-compute-apps gives accurate per-process memory
@@ -474,8 +478,9 @@ def get_gpu_processes(gpus: list[GpuInfo]) -> list[GpuProcess]:
                         procs_by_pid[pid] = GpuProcess(name="unknown", mem_mib=mem, sm_util=0.0)
                 except (ValueError, IndexError):
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] GPU compute-apps query failed: {e}", file=sys.stderr)
 
     # Enrich names using psutil (best effort)
     for pid, proc in list(procs_by_pid.items()):
@@ -500,7 +505,7 @@ def get_gpu_processes(gpus: list[GpuInfo]) -> list[GpuProcess]:
     return result[:5]
 
 
-def get_top_cpu_processes(n: int = 5) -> list[CpuProcess]:
+def get_top_cpu_processes(n: int = 5, debug: bool = False) -> list[CpuProcess]:
     psutil.cpu_percent(interval=0.0)
     candidates = []
     for proc in psutil.process_iter(["name", "memory_info"]):
@@ -509,13 +514,15 @@ def get_top_cpu_processes(n: int = 5) -> list[CpuProcess]:
             mem = proc.info["memory_info"].rss / (1024 * 1024)
             cpu = proc.cpu_percent(interval=0.0)
             candidates.append(CpuProcess(name=name[:18], cpu=cpu, mem_mib=mem))
-        except Exception:
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Failed to inspect CPU process: {e}", file=sys.stderr)
             continue
     candidates.sort(key=lambda p: p.cpu, reverse=True)
     return candidates[:n]
 
 
-def get_system_stats() -> SystemStats:
+def get_system_stats(debug: bool = False) -> SystemStats:
     vm = psutil.virtual_memory()
     swap = psutil.swap_memory()
 
@@ -531,7 +538,9 @@ def get_system_stats() -> SystemStats:
             alloc, unused, maxf = map(int, f.read().strip().split())
         open_fds = alloc - unused
         fds_max = "unlimited" if maxf > 10_000_000 else maxf
-    except Exception:
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] Failed to read file descriptor stats: {e}", file=sys.stderr)
         open_fds, fds_max = 0, 0
 
     # Process breakdown
@@ -846,7 +855,7 @@ def render_processes_panel(cpu_procs: list[CpuProcess], gpu_procs: list[GpuProce
         t.add_column(width=7, style="yellow")
         t.add_column(width=6, justify="right", style="cyan")
         t.add_column(width=8)
-        for p in cpu_procs[:4]:
+        for p in cpu_procs[:5]:
             mem = f"{p.mem_mib/1024:.1f}G" if p.mem_mib > 1024 else f"{p.mem_mib:.0f}M"
             t.add_row(p.name, f"{p.cpu:5.1f}%", mem, mini_bar(p.cpu, 8))
         lines.append(t)
@@ -859,7 +868,7 @@ def render_processes_panel(cpu_procs: list[CpuProcess], gpu_procs: list[GpuProce
         t.add_column(width=6, justify="right", style="cyan")   # memory
         t.add_column(width=7, style="green")      # sm%
         t.add_column(width=8)                     # bar
-        for p in gpu_procs[:4]:
+        for p in gpu_procs[:5]:
             mem_str = f"{p.mem_mib/1024:.1f}G" if p.mem_mib >= 1024 else (f"{p.mem_mib:.0f}M" if p.mem_mib > 1 else "")
             sm_str = f"sm{p.sm_util:4.0f}%" if p.sm_util > 0.5 else ""
             bar = mini_bar(max(p.sm_util, (p.mem_mib / 2048.0 * 100) if p.mem_mib > 0 else 0), 8)
@@ -958,13 +967,13 @@ class KeyReader:
         return sys.stdin.read(1) if dr else None
 
 
-def run(interval: float = DEFAULT_INTERVAL):
+def run(interval: float = DEFAULT_INTERVAL, debug: bool = False):
     key_reader = KeyReader()
 
     with Live(
         build_layout(
-            get_cpu_snapshot(), parse_nvidia_smi(), [], [],
-            get_system_stats(), [], interval
+            get_cpu_snapshot(), parse_nvidia_smi(debug=debug), [], [],
+            get_system_stats(debug=debug), [], interval
         ),
         console=console,
         screen=True,
@@ -985,10 +994,10 @@ def run(interval: float = DEFAULT_INTERVAL):
                 now = time.monotonic()
                 if now - last >= interval:
                     cpu = get_cpu_snapshot()
-                    gpus = parse_nvidia_smi()
-                    gpu_procs = get_gpu_processes(gpus)
-                    cpu_procs = get_top_cpu_processes(4)
-                    sysstats = get_system_stats()
+                    gpus = parse_nvidia_smi(debug=debug)
+                    gpu_procs = get_gpu_processes(gpus, debug=debug)
+                    cpu_procs = get_top_cpu_processes(5, debug=debug)
+                    sysstats = get_system_stats(debug=debug)
                     issues = detect_issues(cpu, gpus, sysstats)
 
                     live.update(build_layout(cpu, gpus, gpu_procs, cpu_procs, sysstats, issues, interval))
@@ -998,13 +1007,25 @@ def run(interval: float = DEFAULT_INTERVAL):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Therminal — Professional System Monitor")
-    parser.add_argument("-i", "--interval", type=float, default=DEFAULT_INTERVAL,
-                        help=f"Refresh interval in seconds (default: {DEFAULT_INTERVAL})")
+    parser = argparse.ArgumentParser(
+        description="Therminal — Professional System Monitor",
+        epilog="Example: therminal.py -i 0.5 --debug"
+    )
+    parser.add_argument(
+        "-i", "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help=f"Refresh interval in seconds (default: {DEFAULT_INTERVAL})"
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print collection errors to stderr instead of silently ignoring them"
+    )
     args = parser.parse_args()
 
     try:
-        run(max(MIN_INTERVAL, min(args.interval, MAX_INTERVAL)))
+        run(max(MIN_INTERVAL, min(args.interval, MAX_INTERVAL)), debug=args.debug)
     except KeyboardInterrupt:
         pass
     finally:

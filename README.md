@@ -52,6 +52,7 @@ python3 therminal.py
 python3 therminal.py                 # default 1.0s refresh
 python3 therminal.py -i 0.5          # faster updates
 python3 therminal.py --interval 2    # slower
+python3 therminal.py --debug         # show collection errors
 ```
 
 ### Controls (while running)
