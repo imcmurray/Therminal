@@ -5,20 +5,26 @@ Therminal — Professional System Monitoring Dashboard
 A beautiful, production-quality terminal UI for monitoring CPU, GPU, system resources,
 and processes with smart alerting, excellent visual hierarchy, and clean design.
 
-Features:
-- Clean Rich-based panels with professional styling
-- Smart color coding (green/yellow/red)
-- Automatic issue detection and dedicated Alerts strip
-- Favored core analysis with long-term history
-- Smooth temperature readings (300-sample averaging)
-- Responsive layout using Rich Layout
-- Keyboard controls (q to quit, +/- for refresh rate)
-
-Usage:
-    python3 therminal.py
-    python3 therminal.py --interval 0.5
-    python3 therminal.py --debug
+Version: 1.0.0
 """
+
+__version__ = "1.0.0"
+
+# Features:
+# - Clean Rich-based panels with professional styling
+# - Smart color coding (green/yellow/red)
+# - Automatic issue detection and dedicated Alerts strip
+# - Favored core analysis with long-term history
+# - Smooth temperature readings (300-sample averaging)
+# - Responsive layout using Rich Layout
+# - Keyboard controls (q to quit, +/- for refresh rate)
+#
+# Usage:
+#     python3 therminal.py
+#     python3 therminal.py --interval 0.5
+#     python3 therminal.py --debug
+#     python3 therminal.py --version
+
 
 import argparse
 import csv
@@ -1010,6 +1016,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Therminal — Professional System Monitor",
         epilog="Example: therminal.py -i 0.5 --debug"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show program's version number and exit"
     )
     parser.add_argument(
         "-i", "--interval",

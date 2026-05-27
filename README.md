@@ -1,5 +1,7 @@
 # Therminal
 
+**Version 1.0.0**
+
 A beautiful, fast terminal dashboard for CPU + GPU load, temperature, power, and system health — with tight integration to load averages and uptime.
 
 ![demo](assets/demo.png)
@@ -53,6 +55,7 @@ python3 therminal.py                 # default 1.0s refresh
 python3 therminal.py -i 0.5          # faster updates
 python3 therminal.py --interval 2    # slower
 python3 therminal.py --debug         # show collection errors
+python3 therminal.py --version       # show version
 ```
 
 ### Controls (while running)
