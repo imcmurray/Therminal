@@ -3,6 +3,17 @@
 
 import argparse
 import csv
+from collections import Counter, deque
+
+# Temperature smoothing to reduce jumpiness in displayed values and per-core history
+_TEMP_SMOOTHING_WINDOW = 300  # ~5 minutes of averaging at ~1s refresh (tunable)
+_package_temp_history: deque[float] = deque(maxlen=_TEMP_SMOOTHING_WINDOW)
+_core_temp_histories: dict[str, deque[float]] = {}  # physical core label -> recent readings
+
+# History window for tracking which physical cores have been hottest over time
+# (used to color the C0-C7 labels in the CORES section)
+_HOTTEST_HISTORY_WINDOW = 1000  # sizeable sampling range for stable long-term view
+import glob
 import os
 import select
 import shutil
@@ -46,6 +57,8 @@ class GpuInfo:
     fan: float           # % or -1 if unavailable
     sm_count: int = 0    # Streaming Multiprocessor count
     cuda_cores: int = 0  # Total CUDA cores (estimated or looked up)
+    sm_clock_mhz: int = 0          # Current SM clock speed
+    throttle_reasons: str = ""     # Human readable throttle status
 
 
 @dataclass
@@ -72,7 +85,7 @@ class CpuSnapshot:
     per_core: list[float]
     freq_mhz: float
     temp_package: float | None
-    temp_cores: list[float]
+    temp_cores: list[tuple[str, float]]   # (label, temperature)
     load1: float
     load5: float
     load15: float
@@ -195,18 +208,40 @@ def get_cpu_snapshot() -> CpuSnapshot:
     freq = psutil.cpu_freq()
     freq_mhz = freq.current if freq else 0.0
 
-    # Temperatures via psutil
+    # Temperatures via psutil (with heavy smoothing for stable display)
     temps = psutil.sensors_temperatures()
-    temp_package = None
-    temp_cores: list[float] = []
+    raw_temp_package = None
+    raw_temp_cores: list[tuple[str, float]] = []
 
     if "coretemp" in temps:
         for entry in temps["coretemp"]:
-            label = (entry.label or "").lower()
-            if "package" in label or entry.label == "Package id 0":
-                temp_package = entry.current
-            elif "core" in label:
-                temp_cores.append(entry.current)
+            label_lower = (entry.label or "").lower()
+            if "package" in label_lower or entry.label == "Package id 0":
+                raw_temp_package = entry.current
+            elif "core" in label_lower:
+                core_label = entry.label or f"Core {len(raw_temp_cores)}"
+                raw_temp_cores.append((core_label, entry.current))
+
+    # Update smoothing buffers
+    if raw_temp_package is not None:
+        _package_temp_history.append(raw_temp_package)
+
+    for label, temp in raw_temp_cores:
+        if label not in _core_temp_histories:
+            _core_temp_histories[label] = deque(maxlen=_TEMP_SMOOTHING_WINDOW)
+        _core_temp_histories[label].append(temp)
+
+    # Compute smoothed values
+    temp_package = None
+    if _package_temp_history:
+        temp_package = sum(_package_temp_history) / len(_package_temp_history)
+
+    temp_cores: list[tuple[str, float]] = []
+    for label in [lbl for lbl, _ in raw_temp_cores]:  # preserve order
+        hist = _core_temp_histories.get(label)
+        if hist:
+            smoothed = sum(hist) / len(hist)
+            temp_cores.append((label, smoothed))
 
     load1, load5, load15 = get_loadavg()
     uptime = get_uptime()
@@ -232,7 +267,8 @@ def parse_nvidia_smi() -> list[GpuInfo]:
             [
                 "nvidia-smi",
                 "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,"
-                "temperature.gpu,power.draw,power.limit,fan.speed",
+                "temperature.gpu,power.draw,power.limit,fan.speed,"
+                "clocks.current.sm,clocks_throttle_reasons.active",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -245,7 +281,7 @@ def parse_nvidia_smi() -> list[GpuInfo]:
         gpus: list[GpuInfo] = []
         reader = csv.reader(result.stdout.strip().splitlines())
         for row in reader:
-            if len(row) < 9:
+            if len(row) < 11:
                 continue
             idx = int(row[0])
             name = row[1].strip()
@@ -256,6 +292,24 @@ def parse_nvidia_smi() -> list[GpuInfo]:
             power = float(row[6]) if row[6].strip() else 0.0
             power_limit = float(row[7]) if row[7].strip() else 0.0
             fan = float(row[8]) if row[8].strip() and row[8].strip() != "-1" else -1.0
+            sm_clock = int(row[9]) if len(row) > 9 and row[9].strip().isdigit() else 0
+            throttle_raw = row[10].strip() if len(row) > 10 else ""
+
+            # Convert throttle bitmask to readable string
+            throttle_str = ""
+            if throttle_raw and throttle_raw.startswith("0x"):
+                try:
+                    mask = int(throttle_raw, 16)
+                    reasons = []
+                    if mask & 0x1: reasons.append("Idle")
+                    if mask & 0x2: reasons.append("App Clocks")
+                    if mask & 0x4: reasons.append("Power Cap")
+                    if mask & 0x8: reasons.append("HW Slowdown")
+                    if mask & 0x10: reasons.append("SW Power Cap")
+                    if mask & 0x20: reasons.append("Thermal")
+                    throttle_str = ", ".join(reasons) if reasons else "None"
+                except:
+                    throttle_str = "Unknown"
 
             gpus.append(
                 GpuInfo(
@@ -268,6 +322,8 @@ def parse_nvidia_smi() -> list[GpuInfo]:
                     power=power,
                     power_limit=power_limit,
                     fan=fan,
+                    sm_clock_mhz=sm_clock,
+                    throttle_reasons=throttle_str,
                 )
             )
 
@@ -342,6 +398,61 @@ def estimate_cuda_cores(gpu_name: str) -> int:
         if key in name:
             return cores
     return 0
+
+
+def detect_tpus() -> list[str]:
+    """Detect available TPUs / ML accelerators on the system."""
+    devices = []
+    try:
+        # Check lspci for TPU-like devices
+        result = subprocess.run(
+            ["lspci"], capture_output=True, text=True, timeout=2
+        )
+        for line in result.stdout.splitlines():
+            lower = line.lower()
+            if any(k in lower for k in ["tpu", "edge tpu", "coral", "google", "habana", "gaudi"]):
+                devices.append(line.strip())
+    except Exception:
+        pass
+
+    # Check for known device files (Google Coral)
+    try:
+        for dev in glob.glob("/dev/apex*"):
+            devices.append(f"Device: {dev}")
+    except Exception:
+        pass
+
+    # Deduplicate
+    return list(dict.fromkeys(devices))
+
+
+def get_tpu_processes() -> list[dict]:
+    """Find processes that appear to be using TPU devices."""
+    tpu_procs = []
+    tpu_keywords = ["/dev/apex", "tpu", "edge_tpu"]
+
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            # Check open files for TPU device paths
+            for f in proc.open_files():
+                if any(kw in f.path.lower() for kw in tpu_keywords):
+                    tpu_procs.append({
+                        "pid": proc.pid,
+                        "name": proc.name(),
+                    })
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    # Dedup by pid
+    seen = set()
+    unique = []
+    for p in tpu_procs:
+        if p["pid"] not in seen:
+            seen.add(p["pid"])
+            unique.append(p)
+
+    return unique
 
 
 def get_system_memory() -> tuple[float, float]:
@@ -424,11 +535,48 @@ def get_enhanced_system_stats() -> dict:
         stats["disk_total"] = 0
         stats["disk_pct"] = 0
 
-    # Process count
+    # Detailed process counts (total + running, broken down by user vs system)
     try:
-        stats["process_count"] = len(psutil.pids())
+        user_total = 0
+        user_running = 0
+        system_total = 0
+        system_running = 0
+        total_running = 0
+
+        for proc in psutil.process_iter(['uids', 'status']):
+            try:
+                uid = proc.info['uids'].real
+                status = proc.info['status']
+
+                is_running = status == psutil.STATUS_RUNNING
+
+                if is_running:
+                    total_running += 1
+
+                if uid == 0:
+                    system_total += 1
+                    if is_running:
+                        system_running += 1
+                else:
+                    user_total += 1
+                    if is_running:
+                        user_running += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        stats["process_total"] = user_total + system_total
+        stats["process_running"] = total_running
+        stats["user_total"] = user_total
+        stats["user_running"] = user_running
+        stats["system_total"] = system_total
+        stats["system_running"] = system_running
     except Exception:
-        stats["process_count"] = 0
+        stats["process_total"] = 0
+        stats["process_running"] = 0
+        stats["user_total"] = 0
+        stats["user_running"] = 0
+        stats["system_total"] = 0
+        stats["system_running"] = 0
 
     # IO Wait (CPU time spent waiting on disk I/O)
     try:
@@ -611,7 +759,10 @@ def render_header(cpu: CpuSnapshot, term_width: int) -> Panel:
     """Top info bar: hostname, uptime, load averages."""
     hostname = os.uname().nodename
     up = cpu.uptime
-    up_str = f"{up.days}d {up.seconds // 3600}h {(up.seconds % 3600) // 60}m"
+    hours = up.seconds // 3600
+    minutes = (up.seconds % 3600) // 60
+    seconds = up.seconds % 60
+    up_str = f"{up.days}d {hours:02d}h {minutes:02d}m {seconds:02d}s"
 
     l1, l2, l3 = cpu.load1, cpu.load5, cpu.load15
     cores = len(cpu.per_core) or psutil.cpu_count() or 1
@@ -637,7 +788,8 @@ def render_header(cpu: CpuSnapshot, term_width: int) -> Panel:
         Text.assemble(
             (hostname, "bold white"),
             ("  •  ", "dim"),
-            (up_str, "cyan"),
+            ("UP ", "bold dim"),
+            (up_str, "bold cyan"),
         ),
         title,
         Text.assemble(
@@ -655,7 +807,7 @@ def render_header(cpu: CpuSnapshot, term_width: int) -> Panel:
     )
 
 
-def render_cpu_panel(cpu: CpuSnapshot) -> Panel:
+def render_cpu_panel(cpu: CpuSnapshot, hottest_core_history: list[int] | None = None) -> Panel:
     """CPU panel: load, per-core, temperatures, frequency."""
     cores = len(cpu.per_core)
     physical = psutil.cpu_count(logical=False) or cores // 2
@@ -663,54 +815,131 @@ def render_cpu_panel(cpu: CpuSnapshot) -> Panel:
     # Overall big bar
     overall_bar = make_bar(cpu.overall, width=17, color=util_color(cpu.overall), label="TOTAL")
 
-    # Per-core compact grid (2 columns)
+    # Per-core utilization for all 8 logical threads (correct for Hyper-Threading)
     core_table = Table.grid(padding=(0, 1))
     core_table.add_column(justify="right", style="dim", width=3)
     core_table.add_column()
     core_table.add_column(justify="right", style="dim", width=3)
     core_table.add_column()
 
+    # Color the logical core labels (C0–C7) based on hottest physical core history over a large sampling window
+    # (orange = moderately often hottest, red = very frequently the hottest over time)
+    hot_freq = {}
+    if hottest_core_history:
+        counter = Counter(hottest_core_history)
+        total = len(hottest_core_history)
+        for phys_idx, count in counter.items():
+            hot_freq[phys_idx] = count / total
+
     for i in range(0, cores, 2):
-        row: list[Any] = [f"C{i}", small_bar(cpu.per_core[i])]
+        phys_idx = i // 2
+        freq = hot_freq.get(phys_idx, 0.0)
+        if freq > 0.60:
+            label_style = "bold red"
+        elif freq > 0.30:
+            label_style = "bold orange1"
+        else:
+            label_style = "dim"
+
+        row = [Text(f"C{i}", style=label_style), small_bar(cpu.per_core[i])]
+
         if i + 1 < cores:
-            row.extend([f"C{i+1}", small_bar(cpu.per_core[i + 1])])
+            phys_idx1 = (i + 1) // 2
+            freq1 = hot_freq.get(phys_idx1, 0.0)
+            if freq1 > 0.60:
+                label_style1 = "bold red"
+            elif freq1 > 0.30:
+                label_style1 = "bold orange1"
+            else:
+                label_style1 = "dim"
+            row.extend([Text(f"C{i+1}", style=label_style1), small_bar(cpu.per_core[i + 1])])
         else:
             row.extend(["", ""])
+
         core_table.add_row(*row)
 
-    # Temperatures
-    temp_lines: list[RenderableType] = []
-    if cpu.temp_package is not None:
-        c = temp_color(cpu.temp_package)
-        temp_lines.append(
-            Text.assemble(
-                ("PKG  ", "dim"),
-                (f"{cpu.temp_package:5.1f}°C", f"bold {c}"),
-            )
-        )
-
+    # Physical core temperatures (only 4 real sensors) + long-term favored %.
+    # The % column directly shows which physical cores run hottest most often.
+    phys_temp_lines = []
     if cpu.temp_cores:
-        avg = sum(cpu.temp_cores) / len(cpu.temp_cores)
-        c = temp_color(avg)
-        temp_lines.append(
-            Text.assemble(
-                ("AVG  ", "dim"),
-                (f"{avg:5.1f}°C", f"bold {c}"),
-                (f"   max {max(cpu.temp_cores):.0f}°C", "dim"),
+        phys_temp_table = Table.grid(padding=(0, 2))
+        phys_temp_table.add_column(style="dim", width=8)
+        phys_temp_table.add_column(justify="right", width=8)
+        phys_temp_table.add_column(justify="right", style="dim", width=5)
+
+        for phys_idx, (label, temp) in enumerate(cpu.temp_cores):
+            c = temp_color(temp)
+            pct = hot_freq.get(phys_idx, 0.0) * 100
+            pct_text = Text(f"{pct:.0f}%", style=("bold red" if pct > 50 else ("yellow" if pct > 28 else "dim"))) if pct >= 1 else Text("")
+            phys_temp_table.add_row(
+                label,
+                Text(f"{temp:5.1f}°C", style=f"bold {c}"),
+                pct_text
             )
+
+        phys_temp_lines = [
+            Text(""),
+            Text("Physical Core Temps (4 sensors) + % time as hottest:", style="bold dim"),
+            phys_temp_table
+        ]
+
+    # PKG temperature + delta (useful for detecting poor thermal paste / uneven contact)
+    pkg_temp_text = Text("")
+    if cpu.temp_package is not None:
+        temp_delta = 0.0
+        delta_color = "green"
+
+        if len(cpu.temp_cores) > 1:
+            core_temps = [t for _, t in cpu.temp_cores]
+            temp_delta = max(core_temps) - min(core_temps)
+            delta_color = "red" if temp_delta > 10 else ("yellow" if temp_delta > 6 else "green")
+
+        c_pkg = delta_color if temp_delta > 6 else temp_color(cpu.temp_package)
+
+        pkg_line = Text.assemble(
+            ("PKG ", "dim"),
+            (f"{cpu.temp_package:5.1f}°C", f"bold {c_pkg}"),
         )
 
-    # Frequency + memory on one line
-    freq_text = Text.assemble(
-        ("FREQ  ", "dim"),
-        (f"{cpu.freq_mhz / 1000:.2f} GHz", "cyan"),
-    )
+        if temp_delta > 0:
+            delta_text = Text.assemble(
+                ("   Δ ", "dim"),
+                (f"{temp_delta:.1f}°C", f"bold {delta_color}"),
+            )
+            pkg_line = Text.assemble(pkg_line, delta_text)
+
+        pkg_temp_text = pkg_line
+
+    # Favored core distribution — extremely useful for spotting persistent thermal
+    # bias, bad paste, or cooling issues on specific physical cores over time.
+    favored_line = Text("")
+    if hottest_core_history and hot_freq:
+        parts: list[Text] = [Text("Favored (1000-sample): ", style="dim")]
+        leader_idx = max(hot_freq, key=hot_freq.get) if hot_freq else 0
+        for p in range(physical):
+            pct = hot_freq.get(p, 0.0) * 100
+            if pct < 0.5:
+                continue
+            col = "red" if pct > 55 else ("yellow" if pct > 30 else "cyan")
+            is_leader = (p == leader_idx and pct > 20)
+            style = f"bold {col}" if is_leader else "dim"
+            parts.append(Text(f" C{p}:{pct:.0f}%", style=style))
+        if len(parts) > 1:
+            leader_label = ""
+            if leader_idx < len(cpu.temp_cores):
+                leader_label = cpu.temp_cores[leader_idx][0]
+            parts.append(Text(f"  lead {leader_label}", style="bold red"))
+            favored_line = Text.assemble(*parts)
 
     model = get_cpu_model()
+    freq_ghz = cpu.freq_mhz / 1000
+
     first_line = Text.assemble(
         (model, "bold white"),
-        ("  •  ", "dim"),
-        (f"{cores}t • {physical}c", "dim"),
+        ("   ", "dim"),
+        (f"{physical}c / {cores}t", "cyan"),
+        ("   ", "dim"),
+        (f"{freq_ghz:.2f} GHz", "cyan"),
     )
 
     content = Group(
@@ -718,13 +947,12 @@ def render_cpu_panel(cpu: CpuSnapshot) -> Panel:
         Text(""),
         overall_bar,
         Text(""),
-        Text("CORES", style="bold dim"),
+        pkg_temp_text,
+        favored_line,
+        Text(""),
+        Text("CORES (4 physical / 8 logical threads)", style="bold dim"),
         core_table,
-        Text(""),
-        Text("TEMPS", style="bold dim"),
-        *temp_lines,
-        Text(""),
-        freq_text,
+        *phys_temp_lines,
     )
 
     return Panel(
@@ -769,19 +997,46 @@ def render_system_panel() -> Panel:
     content = Group(
         ram_bar,
         Text(f"{s['ram_used']:.1f} / {s['ram_total']:.1f} GB", style="dim"),
-        Text(""),
         *swap_lines,
         disk_bar,
         Text(f"{s['disk_used']:.1f} / {s['disk_total']:.1f} GB", style="dim"),
-        Text(""),
         iowait_bar,
         Text(f"{s['iowait']:.1f}% CPU waiting on I/O", style="dim"),
-        Text(""),
         file_bar,
         Text(files_text, style="dim"),
-        Text(""),
-        Text(f"PROCS: {s['process_count']}", style="dim"),
     )
+
+    # Add TPU info if present (simple presence)
+    tpu_devices = detect_tpus()
+    if tpu_devices:
+        content = Group(
+            *content.renderables,
+            Text(""),
+            Text(f"TPU: {len(tpu_devices)} device(s) detected", style="magenta"),
+        )
+
+    # Helpful admin / operator info (kernel, sessions, last reboot)
+    try:
+        host_info: list[RenderableType] = []
+        u = os.uname()
+        host_info.append(Text(f"Kernel: {u.release}", style="dim"))
+        try:
+            n_users = len(psutil.users())
+            host_info.append(Text(f"Users: {n_users} logged in", style="dim"))
+        except Exception:
+            pass
+        boot = datetime.fromtimestamp(psutil.boot_time())
+        host_info.append(Text(f"Booted: {boot.strftime('%Y-%m-%d %H:%M')}", style="dim"))
+
+        if host_info:
+            content = Group(
+                *content.renderables,
+                Text(""),
+                Text("HOST", style="bold dim"),
+                *host_info,
+            )
+    except Exception:
+        pass
 
     return Panel(
         content,
@@ -792,13 +1047,28 @@ def render_system_panel() -> Panel:
     )
 
 
-def render_processes_panel(cpu_procs: list[CpuProcess], gpu_procs: list[GpuProcess]) -> Panel:
-    """Dedicated PROCESSES panel — top CPU and GPU consumers side by side."""
+def render_processes_panel(
+    cpu_procs: list[CpuProcess], 
+    gpu_procs: list[GpuProcess], 
+    tpu_procs: list[dict]
+) -> Panel:
+    """Dedicated PROCESSES panel with Top 3 for CPU and GPU (plus TPU if present)."""
     lines: list[RenderableType] = []
 
-    # CPU processes (top 3)
+    # One-line process summary at the top (moved from SYSTEM panel)
+    s = get_enhanced_system_stats()
+    proc_summary = Text.assemble(
+        ("PROCS ", "dim"),
+        ("A:", "dim"), (f"{s['process_total']}|{s['process_running']}", "cyan"),
+        (" S:", "dim"), (f"{s['system_total']}|{s['system_running']}", "cyan"),
+        (" U:", "dim"), (f"{s['user_total']}|{s['user_running']}", "cyan"),
+    )
+    lines.append(proc_summary)
+    lines.append(Text(""))
+
+    # Top 3 CPU processes
     if cpu_procs:
-        lines.append(Text("TOP CPU", style="bold yellow"))
+        lines.append(Text("Top 3 CPU", style="bold yellow"))
         t = Table.grid(padding=(0, 0))
         t.add_column(style="white", width=14)
         t.add_column(style="yellow", width=7)
@@ -811,11 +1081,12 @@ def render_processes_panel(cpu_procs: list[CpuProcess], gpu_procs: list[GpuProce
             bar = make_memory_bar(min(p.cpu, 100), width=9)
             t.add_row(p.name[:13], cpu_str, mem_str, bar)
         lines.append(t)
-        lines.append(Text(""))
 
-    # GPU processes (top 3)
+    # Top 3 GPU processes
     if gpu_procs:
-        lines.append(Text("TOP GPU", style="bold green"))
+        if cpu_procs:
+            lines.append(Text(""))
+        lines.append(Text("Top 3 GPU", style="bold green"))
         t = Table.grid(padding=(0, 0))
         t.add_column(style="white", width=14)
         t.add_column(style="cyan", width=6, justify="right")
@@ -827,6 +1098,20 @@ def render_processes_panel(cpu_procs: list[CpuProcess], gpu_procs: list[GpuProce
             util_str = f"sm{int(p.sm_util)}%" if p.sm_util > 0.5 else ""
             bar = make_memory_bar(p.sm_util if p.sm_util > 0.1 else p.mem_pct, width=9)
             t.add_row(p.name[:13], mem_str, util_str, bar)
+        lines.append(t)
+
+    # TPU processes (if any detected)
+    if tpu_procs:
+        if cpu_procs or gpu_procs:
+            lines.append(Text(""))
+        lines.append(Text("Top TPU", style="bold magenta"))
+        t = Table.grid(padding=(0, 0))
+        t.add_column(style="white", width=14)
+        t.add_column(style="cyan", width=6, justify="right")
+        t.add_column(width=12)
+
+        for p in tpu_procs[:3]:
+            t.add_row(p["name"][:13], str(p["pid"]), "using TPU")
         lines.append(t)
 
     if not lines:
@@ -860,16 +1145,14 @@ def render_gpu_panel(gpus: list[GpuInfo], procs: list[GpuProcess]) -> Panel:
         if i > 0:
             sections.append(Text(""))
 
-        # Combine GPU name + CUDA cores/SMs on the first line (compact)
+        # First line: GPU name + key specs (CUDA cores + SMs)
         name_parts = [Text(g.name, style="bold white")]
 
         if g.cuda_cores > 0 and g.sm_count > 0:
             name_parts.extend([
                 Text("  •  ", style="dim"),
                 Text(f"{g.cuda_cores}c", style="cyan"),
-                Text(" (", style="dim"),
-                Text(f"{g.sm_count} SMs", style="cyan"),
-                Text(")", style="dim"),
+                Text(f" ({g.sm_count} SMs)", style="dim"),
             ])
         elif g.cuda_cores > 0:
             name_parts.extend([
@@ -913,16 +1196,27 @@ def render_gpu_panel(gpus: list[GpuInfo], procs: list[GpuProcess]) -> Panel:
             (f"{g.mem_used / 1024:.1f} / {g.mem_total / 1024:.1f} GB", "dim"),
         )
 
+        # GPU Performance / Clock info
+        perf_text = Text("")
+        if g.sm_clock_mhz > 0:
+            clock_str = f"{g.sm_clock_mhz} MHz"
+            if g.throttle_reasons and g.throttle_reasons != "None":
+                clock_str += f" (throttled: {g.throttle_reasons})"
+            perf_text = Text.assemble(
+                ("CLOCK ", "dim"),
+                (clock_str, "cyan"),
+            )
+
         gpu_block = Group(
             name_line,
             Text(""),
             util_bar,
-            Text(""),
             mem_bar,
             mem_detail,
             Text(""),
             temp_text,
             power_text,
+            perf_text,
             fan_text,
         )
         sections.append(gpu_block)
@@ -956,6 +1250,8 @@ def build_layout(
     gpus: list[GpuInfo],
     gpu_procs: list[GpuProcess],
     cpu_procs: list[CpuProcess],
+    tpu_procs: list[dict],
+    hottest_core_history: list[int],
     interval: float,
 ) -> Layout:
     term_width = shutil.get_terminal_size((100, 40)).columns
@@ -983,10 +1279,10 @@ def build_layout(
 
     layout["body"].split_column(top, bottom)
 
-    layout["cpu"].update(render_cpu_panel(cpu))
+    layout["cpu"].update(render_cpu_panel(cpu, hottest_core_history))
     layout["gpu"].update(render_gpu_panel(gpus, gpu_procs))
     layout["system"].update(render_system_panel())
-    layout["processes"].update(render_processes_panel(cpu_procs, gpu_procs))
+    layout["processes"].update(render_processes_panel(cpu_procs, gpu_procs, tpu_procs))
 
     layout["footer"].update(render_footer(interval, gpus))
 
@@ -1028,8 +1324,14 @@ class KeyReader:
 def run(interval: float = 1.0):
     key_reader = KeyReader()
 
+    tpu_devices = detect_tpus()
+
+    # Track which physical core has been the hottest recently (for paste quality diagnostics)
+    # Using a large window so the label coloring reflects long-term behavior, not short-term noise.
+    hottest_history: deque[int] = deque(maxlen=_HOTTEST_HISTORY_WINDOW)
+
     with Live(
-        build_layout(get_cpu_snapshot(), parse_nvidia_smi(), [], [], interval),
+        build_layout(get_cpu_snapshot(), parse_nvidia_smi(), [], [], [], [], interval),
         console=console,
         screen=True,
         refresh_per_second=8,
@@ -1055,7 +1357,15 @@ def run(interval: float = 1.0):
                     gpus = parse_nvidia_smi()
                     gpu_procs = get_gpu_processes(gpus)
                     cpu_procs = get_top_cpu_processes(3)
-                    live.update(build_layout(cpu, gpus, gpu_procs, cpu_procs, interval))
+                    tpu_procs = get_tpu_processes()
+
+                    # Record the hottest core this frame
+                    if cpu.temp_cores:
+                        core_temps = [t for _, t in cpu.temp_cores]
+                        hottest_idx = core_temps.index(max(core_temps))
+                        hottest_history.append(hottest_idx)
+
+                    live.update(build_layout(cpu, gpus, gpu_procs, cpu_procs, tpu_procs, list(hottest_history), interval))
                     last_update = now
 
                 time.sleep(0.05)
