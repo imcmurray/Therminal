@@ -2,7 +2,7 @@
 
 A beautiful, fast terminal dashboard for CPU + GPU load, temperature, power, and system health — with tight integration to load averages and uptime.
 
-![demo](assets/demo.png)
+![demo](assets/demo.jpg)
 
 ## Features
 
