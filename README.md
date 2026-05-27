@@ -93,3 +93,5 @@ MIT (or do whatever).
 ---
 
 Built as a first Grok test project. Enjoy the pretty bars. 🔥
+
+Demo screenshot updated to the exact image pasted in chat.
